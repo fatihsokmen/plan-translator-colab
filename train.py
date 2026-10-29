@@ -78,7 +78,8 @@ def main():
     ds = raw.map(to_prompt_completion, remove_columns=raw["train"].column_names)
 
     tok = AutoTokenizer.from_pretrained(args.model)
-    bf16 = torch.cuda.is_available() and torch.cuda.is_bf16_supported()
+    # is_bf16_supported() also says yes for emulated bf16 (T4), which the trainer then rejects; ask for an Ampere or newer GPU.
+    bf16 = torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 8
     model = AutoModelForCausalLM.from_pretrained(args.model, dtype=torch.bfloat16 if bf16 else torch.float32)
 
     config = SFTConfig(
