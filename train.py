@@ -6,7 +6,8 @@ computed on it only. Inputs are built by the app's own ModelPlan.prompt, so trai
     pip install -r training/requirements.txt
     python training/train.py --model google/gemma-3-270m-it --data training/data --out runs/gemma270m
 
-Defaults follow the nl2jq recipe (LoRA r=32, alpha=64, all linear layers, 1 epoch, cosine, lr 1e-4).
+Defaults follow the nl2jq recipe (LoRA r=32, alpha=64, all linear layers, 1 epoch, cosine, lr 1e-4). --qat trains
+against the phone's INT4 rounding (see enable_qat).
 Choose checkpoints on the dev split only; the frozen test set is scored once, by the app (see README).
 """
 import argparse
@@ -14,12 +15,61 @@ import json
 import os
 import random
 
+import copy
+
 import torch
+import torch.nn.functional as F
 from datasets import load_dataset
 from peft import LoraConfig
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from transformers.trainer_utils import get_last_checkpoint
 from trl import SFTConfig, SFTTrainer
+
+
+def fake_int4_b32(w):
+    """The phone model's weights, rounded the way ai_edge_quantizer's dynamic_wi4b32_afp32 rounds them: blocks of 32
+    along the input dimension, symmetric, scale = largest magnitude / 7 kept to 7 mantissa bits, values clipped to -8..7.
+    The rounding passes gradients straight through, so training sees the rounded model and updates the real weights."""
+    out_f, in_f = w.shape
+    g = w.float().reshape(out_f, in_f // 32, 32)
+    scale = (g.abs().amax(-1, keepdim=True).clamp(min=1e-9) / 7).bfloat16().float()
+    q = (torch.clamp(torch.round(g / scale), -8, 7) * scale).reshape(out_f, in_f).to(w.dtype)
+    return w + (q - w).detach()
+
+
+def enable_qat(model):
+    """Quantisation-aware training: every LoRA layer runs on its merged weight (base + adapter) rounded to 4 bits, and
+    the frozen, tied embedding / output table is rounded once, so the adapter learns what survives the phone's INT4."""
+    from peft.tuners.lora.layer import Linear as LoraLinear
+
+    plain = LoraLinear.forward
+
+    def forward(self, x, *args, **kwargs):
+        if self.disable_adapters or self.merged or not self.active_adapters:
+            return plain(self, x, *args, **kwargs)
+        w = self.base_layer.weight
+        for name in self.active_adapters:
+            if name in self.lora_A:
+                w = w + self.get_delta_weight(name)
+        return F.linear(x, fake_int4_b32(w), self.base_layer.bias)
+
+    LoraLinear.forward = forward
+    with torch.no_grad():
+        emb = model.get_input_embeddings().weight
+        emb.copy_(fake_int4_b32(emb))
+        out = model.get_output_embeddings()
+        if out is not None and out.weight.data_ptr() != emb.data_ptr():
+            out.weight.copy_(fake_int4_b32(out.weight))
+
+
+def rounded_copy(model):
+    """The merged model with every linear and embedding weight rounded to INT4 b32: a stand-in for the phone file."""
+    m = copy.deepcopy(model)
+    with torch.no_grad():
+        for mod in m.modules():
+            if isinstance(mod, (torch.nn.Linear, torch.nn.Embedding)) and mod.weight.shape[1] % 32 == 0:
+                mod.weight.copy_(fake_int4_b32(mod.weight))
+    return m
 
 
 def to_prompt_completion(row):
@@ -69,6 +119,7 @@ def main():
     ap.add_argument("--dev_rows", type=int, default=300, help="dev rows generated for the exact-match check")
     ap.add_argument("--eval_rows", type=int, default=200, help="dev rows used for the loss during training")
     ap.add_argument("--save_steps", type=int, default=500)
+    ap.add_argument("--qat", action="store_true", help="train against the INT4 b32 rounding the phone model gets (LoRA only)")
     args = ap.parse_args()
 
     files = {"train": f"{args.data}/train/train.jsonl", "dev": f"{args.data}/dev/dev.jsonl"}
@@ -81,6 +132,9 @@ def main():
     # is_bf16_supported() also says yes for emulated bf16 (T4), which the trainer then rejects; ask for an Ampere or newer GPU.
     bf16 = torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 8
     model = AutoModelForCausalLM.from_pretrained(args.model, dtype=torch.bfloat16 if bf16 else torch.float32)
+    if args.qat:
+        assert not args.full, "--qat rounds the LoRA layers' merged weights; use it with LoRA"
+        enable_qat(model)
 
     config = SFTConfig(
         output_dir=args.out,
@@ -120,6 +174,9 @@ def main():
     random.Random(args.seed).shuffle(dev_rows)
     exact, valid = dev_exact_match(final, tok, dev_rows, limit=args.dev_rows)
     print(f"dev: exact plan {exact:.3f} · valid JSON {valid:.3f} ({min(args.dev_rows, len(dev_rows))} random dev rows)")
+    # The same rows on weights rounded as the phone's INT4 file rounds them: the gap is what quantisation costs.
+    exact4, valid4 = dev_exact_match(rounded_copy(final), tok, dev_rows, limit=args.dev_rows)
+    print(f"dev int4 (simulated): exact plan {exact4:.3f} · valid JSON {valid4:.3f}")
 
 
 if __name__ == "__main__":
